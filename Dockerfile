@@ -36,6 +36,6 @@ COPY VERSION ./
 COPY services ./services
 COPY --from=web-build /app/web/out ./web_dist
 
-EXPOSE 80
+EXPOSE 7860
 
-CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--access-log"]
+CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860", "--access-log"]
