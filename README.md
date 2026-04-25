@@ -17,6 +17,9 @@
 > [!IMPORTANT]
 > 本项目基于对 ChatGPT 官网相关能力的逆向研究实现，存在账号受限、临时封禁或永久封禁的风险。请勿使用你自己的重要账号、常用账号或高价值账号进行测试。
 
+> [!CAUTION]
+> 旧版本存在已知漏洞，请尽快升级到最新版本。公网部署时请尽量不要放置敏感信息，并自行做好访问控制与隔离。
+
 ## 快速开始
 
 已发布镜像支持 `linux/amd64` 与 `linux/arm64`，在 x86 服务器和 Apple Silicon / ARM Linux 设备上都会自动拉取匹配架构的版本。
@@ -26,6 +29,22 @@ git clone git@github.com:basketikun/chatgpt2api.git
 # 按需编辑 config.json 的密钥和 `refresh_account_interval_minute`
 # 也可以直接通过环境变量 CHATGPT2API_AUTH_KEY 覆盖 auth-key
 docker compose up -d
+```
+
+### 存储后端配置
+
+支持通过环境变量 `STORAGE_BACKEND` 切换存储方式：
+
+- `json` - 本地 JSON 文件（默认）
+- `sqlite` - 本地 SQLite 数据库
+- `postgres` - 外部 PostgreSQL（需配置 `DATABASE_URL`）
+- `git` - Git 私有仓库（需配置 `GIT_REPO_URL` 和 `GIT_TOKEN`）
+
+示例：使用 PostgreSQL
+```yaml
+environment:
+  - STORAGE_BACKEND=postgres
+  - DATABASE_URL=postgresql://user:password@host:5432/dbname
 ```
 
 ## 功能

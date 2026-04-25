@@ -332,7 +332,7 @@ class ChatGPTService:
                 image_data, mime_type = image_info
                 image_result = self.edit_with_pool(prompt, [(image_data, "image.png", mime_type)], model, 1)
             else:
-                image_result = self.generate_with_pool(prompt, model, 1)
+                image_result = self.generate_with_pool(prompt, model, 1, size="1:1")
         except ImageGenerationError as exc:
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
@@ -385,7 +385,7 @@ class ChatGPTService:
                 image_data, mime_type = image_info
                 stream = self.stream_image_edit(prompt, [(image_data, "image.png", mime_type)], model, 1)
             else:
-                stream = self.stream_image_generation(prompt, model, 1)
+                stream = self.stream_image_generation(prompt, model, 1, size="1:1")
 
             for chunk in stream:
                 data = chunk.get("data")
@@ -513,6 +513,7 @@ class ChatGPTService:
             index: int,
             total: int,
             request_token: str,
+            size: str | None = None,
             response_format: str = "b64_json",
             base_url: str | None = None,
             images: list[str] | None = None,
@@ -520,6 +521,7 @@ class ChatGPTService:
         stream = self._new_backend(request_token).stream_image_chat_completions(
             prompt=prompt,
             model=model,
+            size=size,
             images=images or None,
         )
         for chunk in stream:
@@ -566,6 +568,7 @@ class ChatGPTService:
             prompt: str,
             model: str,
             n: int,
+            size: str | None = None,
             response_format: str = "b64_json",
             base_url: str | None = None,
     ) -> Iterator[dict[str, object]]:
@@ -598,6 +601,7 @@ class ChatGPTService:
                     result = self._format_image_result(self._new_backend(request_token).images_generations(
                         prompt=prompt,
                         model=model,
+                        size=size,
                         response_format="b64_json",
                     ), prompt, response_format, base_url)
                     account = self.account_service.mark_image_result(request_token, success=True)
@@ -639,11 +643,11 @@ class ChatGPTService:
         if not emitted:
             raise ImageGenerationError(last_error or "image generation failed")
 
-    def generate_with_pool(self, prompt: str, model: str, n: int, response_format: str = "b64_json",
+    def generate_with_pool(self, prompt: str, model: str, n: int, size: str | None = None, response_format: str = "b64_json",
                            base_url: str = None):
         created = None
         image_items: list[dict[str, object]] = []
-        for result in self._iter_generated_images_with_pool(prompt, model, n, response_format, base_url):
+        for result in self._iter_generated_images_with_pool(prompt, model, n, size, response_format, base_url):
             if created is None:
                 created = result.get("created")
             data = result.get("data")
@@ -659,6 +663,7 @@ class ChatGPTService:
             prompt: str,
             model: str,
             n: int,
+            size: str | None = None,
             response_format: str = "b64_json",
             base_url: str | None = None,
     ) -> Iterator[dict[str, object]]:
@@ -696,6 +701,7 @@ class ChatGPTService:
                             index,
                             n,
                             request_token,
+                            size,
                             response_format,
                             base_url,
                     ):
@@ -743,6 +749,7 @@ class ChatGPTService:
             images: Iterable[tuple[bytes, str, str]],
             model: str,
             n: int,
+            size: str | None = None,
             response_format: str = "b64_json",
             base_url: str = None,
     ):
@@ -780,6 +787,7 @@ class ChatGPTService:
                         image=self._encode_images(normalized_images),
                         prompt=prompt,
                         model=model,
+                        size=size,
                         response_format="b64_json",
                     ), prompt, response_format, base_url)
                     account = self.account_service.mark_image_result(request_token, success=True)
@@ -829,6 +837,7 @@ class ChatGPTService:
             images: Iterable[tuple[bytes, str, str]],
             model: str,
             n: int,
+            size: str | None = None,
             response_format: str = "b64_json",
             base_url: str | None = None,
     ) -> Iterator[dict[str, object]]:
@@ -867,14 +876,15 @@ class ChatGPTService:
                 has_result = False
                 try:
                     for chunk in self._stream_single_image_result(
-                            prompt,
-                            model,
-                            index,
-                            n,
-                            request_token,
-                            response_format,
-                            base_url,
-                            encoded_images,
+                            prompt=prompt,
+                            model=model,
+                            index=index,
+                            total=n,
+                            request_token=request_token,
+                            size=size,
+                            response_format=response_format,
+                            base_url=base_url,
+                            images=encoded_images,
                     ):
                         emitted = True
                         emitted_for_request = True
@@ -955,11 +965,11 @@ class ChatGPTService:
         if not prompt:
             raise HTTPException(status_code=400, detail={"error": "prompt is required"})
 
-        image_info = extract_chat_image(body)
+        image_infos = extract_chat_image(body)
         try:
-            if image_info:
-                image_data, mime_type = image_info
-                image_result = self.edit_with_pool(prompt, [(image_data, "image.png", mime_type)], model, n)
+            if image_infos:
+                images = [(data, f"image_{idx}.png", mime) for idx, (data, mime) in enumerate(image_infos, start=1)]
+                image_result = self.edit_with_pool(prompt, images, model, n)
             else:
                 image_result = self.generate_with_pool(prompt, model, n)
         except ImageGenerationError as exc:
@@ -979,11 +989,11 @@ class ChatGPTService:
         if not prompt:
             raise HTTPException(status_code=400, detail={"error": "prompt is required"})
 
-        image_info = extract_chat_image(body)
+        image_infos = extract_chat_image(body)
         encoded_images = []
-        if image_info:
-            image_data, mime_type = image_info
-            encoded_images = self._encode_images([(image_data, "image.png", mime_type)])
+        if image_infos:
+            images = [(data, f"image_{idx}.png", mime) for idx, (data, mime) in enumerate(image_infos, start=1)]
+            encoded_images = self._encode_images(images)
 
         last_error = ""
         while True:
