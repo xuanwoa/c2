@@ -1,18 +1,93 @@
 import base64
-import json
 import hashlib
-import uuid
+import json
+import re
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterator
+from typing import Any, Iterator
 
 from curl_cffi import requests
-import re
 from fastapi import HTTPException
 from utils.log import logger
 
 IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+
+SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
+MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_JSON_EDIT_IMAGES = 10
+DATA_URL_IMAGE_RE = re.compile(r"^data:(?P<mime>[-+./\w]+);base64,(?P<data>.*)$", re.DOTALL)
+
+
+def _image_extension(mime_type: str) -> str:
+    image_type = mime_type.split("/", 1)[1].split(";", 1)[0].lower() if "/" in mime_type else "png"
+    return "jpg" if image_type == "jpeg" else image_type or "png"
+
+
+def _decode_json_image_string(value: str, index: int, filename: str | None = None, mime_type: str | None = None) -> tuple[bytes, str, str]:
+    text = value.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail={"error": "image file is empty"})
+    match = DATA_URL_IMAGE_RE.match(text)
+    if match:
+        resolved_mime = (match.group("mime") or "image/png").lower()
+        encoded = match.group("data")
+    else:
+        if text.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail={"error": "remote image URLs are not supported"})
+        resolved_mime = (mime_type or "image/png").lower()
+        encoded = text
+    if resolved_mime == "image/jpg":
+        resolved_mime = "image/jpeg"
+    if resolved_mime not in SUPPORTED_JSON_IMAGE_MIME_TYPES:
+        raise HTTPException(status_code=400, detail={"error": "unsupported image mime type"})
+    try:
+        image_data = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid base64 image data"}) from exc
+    if not image_data:
+        raise HTTPException(status_code=400, detail={"error": "image file is empty"})
+    if len(image_data) > MAX_JSON_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail={"error": "image file is too large"})
+    return image_data, filename or f"image_{index}.{_image_extension(resolved_mime)}", resolved_mime
+
+
+def _extract_json_image_value(item: object) -> tuple[str, str | None, str | None]:
+    if isinstance(item, str):
+        return item, None, None
+    if not isinstance(item, dict):
+        raise HTTPException(status_code=400, detail={"error": "image entry must be a base64 string or object"})
+    filename = str(item.get("filename") or item.get("file_name") or "").strip() or None
+    mime_type = str(item.get("mime_type") or item.get("mimeType") or "").strip() or None
+    value = item.get("b64_json") or item.get("base64")
+    if not value:
+        image_url = item.get("image_url") or item.get("url")
+        if isinstance(image_url, dict):
+            filename = filename or str(image_url.get("filename") or image_url.get("file_name") or "").strip() or None
+            mime_type = mime_type or str(image_url.get("mime_type") or image_url.get("mimeType") or "").strip() or None
+            value = image_url.get("url") or image_url.get("image_url")
+        else:
+            value = image_url
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(status_code=400, detail={"error": "image entry must include image data"})
+    return value, filename, mime_type
+
+
+def normalize_json_edit_images(image: object = None, images: object = None) -> list[tuple[bytes, str, str]]:
+    raw_images = images if images is not None else image
+    if raw_images is None:
+        raise HTTPException(status_code=400, detail={"error": "image file is required"})
+    entries = raw_images if isinstance(raw_images, list) else [raw_images]
+    if not entries:
+        raise HTTPException(status_code=400, detail={"error": "image file is required"})
+    if len(entries) > MAX_JSON_EDIT_IMAGES:
+        raise HTTPException(status_code=400, detail={"error": f"images supports up to {MAX_JSON_EDIT_IMAGES} items"})
+    normalized = []
+    for index, item in enumerate(entries, start=1):
+        value, filename, mime_type = _extract_json_image_value(item)
+        normalized.append(_decode_json_image_string(value, index, filename, mime_type))
+    return normalized
 
 
 def new_uuid() -> str:
@@ -24,10 +99,42 @@ def is_image_chat_request(body: dict[str, object]) -> bool:
     modalities = body.get("modalities")
     if model in IMAGE_MODELS:
         return True
-    if isinstance(modalities, list):
-        normalized = {str(item or "").strip().lower() for item in modalities}
-        return "image" in normalized
-    return False
+    return isinstance(modalities, list) and "image" in {str(item or "").strip().lower() for item in modalities}
+
+
+_UPSTREAM_BODY_LOG_LIMIT = 500
+
+
+class UpstreamHTTPError(RuntimeError):
+    """Raised when an upstream HTTP call returns a non-2xx status.
+
+    Carries structured fields (status_code, body, retry_after) so callers can
+    branch on status code instead of string-matching on str(exc). The full
+    body is preserved on the instance; the formatted message truncates it
+    to keep log lines reasonable.
+    """
+
+    def __init__(
+        self,
+        context: str,
+        status_code: int,
+        body: Any,
+        retry_after: int | None = None,
+    ) -> None:
+        self.context = context
+        self.status_code = status_code
+        self.body = body
+        self.retry_after = retry_after
+        if isinstance(body, (dict, list)):
+            try:
+                body_str = json.dumps(body, ensure_ascii=False)
+            except (TypeError, ValueError):
+                body_str = repr(body)
+        else:
+            body_str = str(body)
+        if len(body_str) > _UPSTREAM_BODY_LOG_LIMIT:
+            body_str = body_str[:_UPSTREAM_BODY_LOG_LIMIT] + "…[truncated]"
+        super().__init__(f"{context} failed: status={status_code}, body={body_str}")
 
 
 def ensure_ok(response: requests.Response, context: str) -> None:
@@ -38,24 +145,13 @@ def ensure_ok(response: requests.Response, context: str) -> None:
         body = response.json()
     except Exception:
         pass
-    raise RuntimeError(f"{context} failed: status={response.status_code}, body={body}")
-
-
-def parse_sse_lines(response: requests.Response) -> Iterator[Dict[str, Any]]:
-    for raw_line in response.iter_lines():
-        if not raw_line:
-            continue
-        line = raw_line.decode("utf-8", errors="ignore")
-        if not line.startswith("data:"):
-            continue
-        payload = line[5:].strip()
-        if payload == "[DONE]":
-            yield {"done": True}
-            break
-        try:
-            yield json.loads(payload)
-        except json.JSONDecodeError:
-            yield {"raw": payload}
+    retry_after_header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
+    retry_after: int | None = None
+    if retry_after_header is not None:
+        ra_str = str(retry_after_header).strip()
+        if ra_str.isdigit():
+            retry_after = int(ra_str)
+    raise UpstreamHTTPError(context, response.status_code, body, retry_after=retry_after)
 
 
 def sse_json_stream(items) -> Iterator[str]:
@@ -69,8 +165,40 @@ def sse_json_stream(items) -> Iterator[str]:
             "error_type": exc.__class__.__name__,
             "error": str(exc),
         })
-        yield f"data: {json.dumps({'error': {'message': str(exc), 'type': exc.__class__.__name__}}, ensure_ascii=False)}\n\n"
+        error = exc.to_openai_error() if hasattr(exc, "to_openai_error") else {
+            "error": {"message": str(exc), "type": exc.__class__.__name__}
+        }
+        yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+def anthropic_sse_stream(items) -> Iterator[str]:
+    try:
+        for item in items:
+            event = str(item.get("type") or "message_delta") if isinstance(item, dict) else "message_delta"
+            yield f"event: {event}\n"
+            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+    except Exception as exc:
+        logger.warning({
+            "event": "anthropic_sse_stream_error",
+            "error_type": exc.__class__.__name__,
+            "error": str(exc),
+        })
+        error = {"type": "error", "error": {"type": exc.__class__.__name__, "message": str(exc)}}
+        yield "event: error\n"
+        yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+
+
+def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
+    for raw_line in response.iter_lines():
+        if not raw_line:
+            continue
+        line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload:
+            yield payload
 
 
 def save_images_from_text(text: str, prefix: str) -> list[Path]:
@@ -221,22 +349,6 @@ def parse_image_count(raw_value: object) -> int:
     if value < 1 or value > 4:
         raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
     return value
-
-
-def build_chat_image_completion(model: str, image_result: dict[str, object]) -> dict[str, object]:
-    created = int(image_result.get("created") or time.time())
-    return {
-        "id": f"chatcmpl-{uuid.uuid4().hex}",
-        "object": "chat.completion",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": build_chat_image_markdown_content(image_result)},
-            "finish_reason": "stop",
-        }],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    }
 
 
 def build_chat_image_markdown_content(image_result: dict[str, object]) -> str:
